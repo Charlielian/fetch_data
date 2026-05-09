@@ -90,7 +90,7 @@ def test_capture():
 
     print(f"\n  前 10 条请求:")
     for i, r in enumerate(requests[:10]):
-        s = r.get("status_code") or "..."
+        s = str(r.get("status_code") or "...")
         print(f"    [{i+1}] {r['method']:6s} {s:>4s} {r['resource_type']:12s} {r['url'][:80]}")
 
     if len(requests) >= 5:
