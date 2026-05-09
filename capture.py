@@ -31,6 +31,7 @@ class RequestCapture:
 
     def start(self):
         self._running = True
+        self._last_count = 0  # 重置计数器
 
     def stop(self):
         self._running = False
@@ -64,6 +65,7 @@ class RequestCapture:
     def clear(self):
         with self._lock:
             self.requests.clear()
+            self._last_count = 0  # 重置计数器
 
     def export_json(self, filepath):
         with self._lock:
