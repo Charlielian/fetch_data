@@ -73,8 +73,16 @@ def interactive_capture():
     except KeyboardInterrupt:
         print("\n用户中断")
 
-    browser.close()
-    pw.stop()
+    # 安全关闭浏览器
+    try:
+        if browser.is_connected():
+            browser.close()
+    except Exception:
+        pass
+    try:
+        pw.stop()
+    except Exception:
+        pass
     capture.stop()
 
     requests = capture.get_requests()
