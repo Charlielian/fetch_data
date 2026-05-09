@@ -715,7 +715,11 @@ class CaptureGUI:
 
             page.on("request", on_request)
             page.on("response", on_response)
-            logger.info("事件监听已注册")
+
+            # 关键：同时监听 context 级别的事件，捕获新页面/新标签的请求
+            context.on("request", on_request)
+            context.on("response", on_response)
+            logger.info("事件监听已注册（page + context 级别）")
 
             self.root.after(0, lambda: self.status_label.configure(
                 text=f"浏览器已启动 - 正在抓包中... | URL: {url}"))
