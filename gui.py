@@ -7,12 +7,30 @@ Playwright 网络抓包工具 - GUI 界面
 import sys
 import os
 import json
+import logging
+import time
 import threading
 import webbrowser
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, scrolledtext
 from datetime import datetime
 from capture import RequestCapture, resource_path
+
+# 配置日志 - 输出到文件和控制台
+LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
+os.makedirs(LOG_DIR, exist_ok=True)
+LOG_FILE = os.path.join(LOG_DIR, f"capture_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log")
+
+logging.basicConfig(
+    level=logging.DEBUG,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.FileHandler(LOG_FILE, encoding="utf-8"),
+        logging.StreamHandler(sys.stdout),
+    ]
+)
+logger = logging.getLogger(__name__)
+logger.info(f"日志文件: {LOG_FILE}")
 
 
 class CaptureGUI:
@@ -48,7 +66,7 @@ class CaptureGUI:
     }
 
     def __init__(self):
-        self.capture = RequestCapture(on_request_callback=self._on_new_request)
+        self.capture = RequestCapture()
         self.browser_thread = None
         self.playwright = None
         self.browser = None
@@ -56,7 +74,7 @@ class CaptureGUI:
         self.page = None
         self.is_running = False
         self.request_count = 0
-        self._update_pending = False
+        self._poll_job = None  # 定时轮询任务 ID
 
         self.root = tk.Tk()
         self.root.title("🔍 Playwright 网络抓包工具")
@@ -189,6 +207,8 @@ class CaptureGUI:
         # 导出按钮
         ttk.Button(toolbar, text="💾 导出 JSON",
                    command=self._export_json).pack(side=tk.LEFT, padx=(0, 5))
+        ttk.Button(toolbar, text="📄 导出 HAR",
+                   command=self._export_har).pack(side=tk.LEFT, padx=(0, 5))
 
         # URL 输入框
         url_frame = ttk.Frame(toolbar, style="Toolbar.TFrame")
@@ -268,7 +288,7 @@ class CaptureGUI:
         self.tree.column("status", width=60, minwidth=50, anchor=tk.CENTER)
         self.tree.column("url", width=500, minwidth=200)
         self.tree.column("type", width=100, minwidth=80)
-        self.tree.column("size", width=80, minwidth=60, anchor=tk.RIGHT)
+        self.tree.column("size", width=80, minwidth=60, anchor=tk.E)
         self.tree.column("time", width=160, minwidth=120)
 
         # 滚动条
@@ -393,27 +413,36 @@ class CaptureGUI:
         else:
             return self.COLORS["error"]
 
-    def _on_new_request(self, req_data):
-        """新请求回调（在浏览器线程中调用，通过 after 转到主线程）"""
-        if not self._update_pending:
-            self._update_pending = True
-            self.root.after(100, self._process_pending_requests)
+    def _start_polling(self):
+        """启动定时轮询，每 200ms 从 capture 中读取新增请求并更新表格"""
+        if self._poll_job is not None:
+            return
+        self._poll()
 
-    def _process_pending_requests(self):
-        """批量处理待显示的请求"""
-        self._update_pending = False
-        requests = self.capture.get_requests()
-        current_count = self.tree.get_children().__len__()
+    def _poll(self):
+        """轮询一次：读取新增请求，更新表格"""
+        new_requests = self.capture.get_new_requests()
+        if new_requests:
+            for req in new_requests:
+                self.request_count += 1
+                self._insert_request_row(req, self.request_count)
+            self.count_label.configure(text=f"共 {self.request_count} 条请求")
 
-        for i in range(current_count, len(requests)):
-            req = requests[i]
-            self._insert_request_row(req, i + 1)
+        if self.is_running:
+            self._poll_job = self.root.after(200, self._poll)
 
-        self.request_count = len(requests)
-        self.count_label.configure(text=f"共 {self.request_count} 条请求")
-
-        if self._update_pending:
-            self.root.after(100, self._process_pending_requests)
+    def _stop_polling(self):
+        """停止定时轮询"""
+        if self._poll_job is not None:
+            self.root.after_cancel(self._poll_job)
+            self._poll_job = None
+        # 最后再拉一次，确保不遗漏
+        new_requests = self.capture.get_new_requests()
+        if new_requests:
+            for req in new_requests:
+                self.request_count += 1
+                self._insert_request_row(req, self.request_count)
+            self.count_label.configure(text=f"共 {self.request_count} 条请求")
 
     def _insert_request_row(self, req, index):
         """插入一行请求到表格"""
@@ -570,62 +599,95 @@ class CaptureGUI:
         self.stop_btn.configure(state=tk.NORMAL)
         self.status_label.configure(text="正在启动浏览器...")
 
+        # 启动定时轮询
+        self._start_polling()
+
         self.browser_thread = threading.Thread(target=self._run_browser, args=(url,), daemon=True)
         self.browser_thread.start()
 
     def _run_browser(self, url):
         """在独立线程中运行浏览器"""
+        logger.info(f"=== 浏览器线程启动 === url={url}")
         try:
             from playwright.sync_api import sync_playwright
+            logger.info("Playwright 导入成功")
 
-            with sync_playwright() as p:
-                self.playwright = p
+            self.playwright = sync_playwright().start()
+            logger.info("sync_playwright().start() 成功")
 
-                # 启动 Chromium 浏览器（有头模式）
-                self.browser = p.chromium.launch(
-                    headless=False,
-                    args=[
-                        "--disable-blink-features=AutomationControlled",
-                        "--no-sandbox",
-                    ]
-                )
+            # 启动 Chromium 浏览器（有头模式）
+            logger.info("正在启动 Chromium...")
+            self.browser = self.playwright.chromium.launch(
+                headless=False,
+                args=[
+                    "--disable-blink-features=AutomationControlled",
+                    "--no-sandbox",
+                ]
+            )
+            logger.info(f"Chromium 启动成功, connected={self.browser.is_connected()}")
 
-                # 创建上下文
-                self.context = self.browser.new_context(
-                    viewport={"width": 1280, "height": 800},
-                    user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-                )
+            # 创建上下文
+            self.context = self.browser.new_context(
+                viewport={"width": 1280, "height": 800},
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            )
+            logger.info("浏览器上下文创建成功")
 
-                # 创建页面
-                self.page = self.context.new_page()
+            # 创建页面
+            self.page = self.context.new_page()
+            logger.info("页面创建成功")
 
-                # 注册网络请求监听
-                self.page.on("request", self._on_request)
-                self.page.on("response", self._on_response)
+            # 注册网络请求监听
+            self.page.on("request", self._on_request)
+            self.page.on("response", self._on_response)
+            logger.info("网络请求监听已注册")
 
-                self.root.after(0, lambda: self.status_label.configure(
-                    text=f"浏览器已启动 - 正在抓包中... | URL: {url}"))
+            self.root.after(0, lambda: self.status_label.configure(
+                text=f"浏览器已启动 - 正在抓包中... | URL: {url}"))
 
-                # 导航到目标 URL
-                self.page.goto(url, wait_until="domcontentloaded")
+            # 导航到目标 URL
+            logger.info(f"正在导航到: {url}")
+            self.page.goto(url, wait_until="domcontentloaded")
+            logger.info(f"页面加载完成: {url}")
 
-                # 等待浏览器关闭
-                try:
-                    while self.is_running and self.page:
-                        time.sleep(0.5)
-                except Exception:
-                    pass
+            # 保持浏览器打开，直到用户点击停止或手动关闭浏览器窗口
+            logger.info("进入保持循环, 等待用户操作...")
+            try:
+                loop_count = 0
+                while self.is_running:
+                    # 检查浏览器是否被用户手动关闭
+                    connected = self.browser.is_connected()
+                    if not connected:
+                        logger.warning(f"浏览器连接已断开 (loop #{loop_count})")
+                        break
+                    if loop_count % 20 == 0:
+                        logger.debug(f"保持循环中... (loop #{loop_count}, connected={connected})")
+                    loop_count += 1
+                    time.sleep(0.5)
+                logger.info(f"保持循环退出, loop_count={loop_count}, is_running={self.is_running}")
+            except Exception as e:
+                logger.error(f"保持循环异常: {e}", exc_info=True)
 
         except ImportError:
+            logger.error("Playwright 库未安装")
             self.root.after(0, lambda: self._show_error(
                 "缺少 Playwright 库！\n\n请运行以下命令安装：\n"
                 "pip install playwright\n"
                 "playwright install chromium"
             ))
         except Exception as e:
+            logger.error(f"浏览器启动失败: {e}", exc_info=True)
             self.root.after(0, lambda: self._show_error(f"启动浏览器失败：\n{str(e)}"))
         finally:
+            logger.info("=== 浏览器线程结束, 开始清理 ===")
+            try:
+                if self.playwright:
+                    self.playwright.stop()
+                    logger.info("playwright.stop() 完成")
+            except Exception as e:
+                logger.error(f"playwright.stop() 异常: {e}", exc_info=True)
             self._cleanup_browser()
+            logger.info("清理完成")
 
     def _on_request(self, request):
         """处理请求事件"""
@@ -635,18 +697,24 @@ class CaptureGUI:
                 headers = request.headers
                 if headers:
                     req_headers = dict(headers)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug(f"获取请求头失败: {e}")
 
             req_body = ""
             try:
                 post_data = request.post_data
                 if post_data:
                     req_body = post_data
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug(f"获取请求体失败: {e}")
+
+            # 使用自增序号作为唯一 ID，避免 URL+method 重复导致覆盖
+            if not hasattr(self, '_req_counter'):
+                self._req_counter = 0
+            self._req_counter += 1
 
             req_data = {
+                "_id": self._req_counter,
                 "url": request.url,
                 "method": request.method,
                 "resource_type": request.resource_type,
@@ -659,22 +727,39 @@ class CaptureGUI:
                 "response_size": None,
             }
 
-            # 存储请求数据，等响应到达时补充
+            # 用唯一 ID 存储到 pending，等响应到达时补充
             if not hasattr(self, '_pending_requests'):
                 self._pending_requests = {}
-            self._pending_requests[request.url + str(request.method)] = req_data
+            self._pending_requests[id(request)] = req_data
 
-        except Exception:
-            pass
+            # 直接添加到捕获列表
+            self.capture.add_request(req_data)
+
+        except Exception as e:
+            logger.error(f"_on_request 异常: {e}", exc_info=True)
 
     def _on_response(self, response):
-        """处理响应事件"""
+        """处理响应事件 - 更新已有请求的响应信息"""
         try:
-            key = response.url + response.request.method
-            req_data = getattr(self, '_pending_requests', {}).get(key)
+            # 通过 request 对象的 id 查找对应的 pending 记录
+            req_data = None
+            if hasattr(self, '_pending_requests'):
+                # 遍历找到匹配的请求（url + method + 时间戳匹配）
+                for key, pending in list(self._pending_requests.items()):
+                    if (pending.get("url") == response.url and
+                            pending.get("method") == response.request.method and
+                            pending.get("status_code") is None):
+                        req_data = pending
+                        self._pending_requests.pop(key, None)
+                        break
 
             if req_data is None:
+                # 没有对应的请求记录，创建一个新的
+                if not hasattr(self, '_req_counter'):
+                    self._req_counter = 0
+                self._req_counter += 1
                 req_data = {
+                    "_id": self._req_counter,
                     "url": response.url,
                     "method": response.request.method,
                     "resource_type": "",
@@ -686,15 +771,17 @@ class CaptureGUI:
                     "response_body": "",
                     "response_size": None,
                 }
+                self.capture.add_request(req_data)
 
+            # 更新响应信息
             req_data["status_code"] = response.status
 
             # 获取响应头
             try:
                 resp_headers = dict(response.headers)
                 req_data["response_headers"] = resp_headers
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug(f"获取响应头失败: {e}")
 
             # 获取响应体
             try:
@@ -713,22 +800,21 @@ class CaptureGUI:
                     if body:
                         req_data["response_body"] = body
                         req_data["response_size"] = len(body.encode("utf-8"))
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug(f"获取响应体失败 [{response.url}]: {e}")
 
-            # 从 pending 中移除并添加到捕获列表
-            if hasattr(self, '_pending_requests'):
-                self._pending_requests.pop(key, None)
+            # 通知 GUI 刷新该行
+            self.capture.update_request(req_data)
 
-            self.capture.add_request(req_data)
-
-        except Exception:
-            pass
+        except Exception as e:
+            logger.error(f"_on_response 异常: {e}", exc_info=True)
 
     def _stop_browser(self):
         """停止浏览器"""
+        logger.info("用户点击停止抓包")
         self.is_running = False
         self.capture.stop()
+        self._stop_polling()
         self.status_label.configure(text="正在停止浏览器...")
         self.stop_btn.configure(state=tk.DISABLED)
 
@@ -801,6 +887,36 @@ class CaptureGUI:
             except Exception as e:
                 messagebox.showerror("导出失败", f"导出失败：\n{str(e)}")
 
+    def _export_har(self):
+        """导出请求为 HAR 文件（可用 Chrome DevTools 打开）"""
+        requests = self.capture.get_requests()
+        if not requests:
+            messagebox.showinfo("提示", "没有可导出的请求数据")
+            return
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        default_name = f"capture_{timestamp}.har"
+
+        filepath = filedialog.asksaveasfilename(
+            title="导出 HAR 文件",
+            defaultextension=".har",
+            initialfile=default_name,
+            filetypes=[("HAR 文件", "*.har"), ("所有文件", "*.*")]
+        )
+
+        if filepath:
+            try:
+                self.capture.export_har(filepath)
+                messagebox.showinfo(
+                    "导出成功",
+                    f"已导出 {len(requests)} 条请求到：\n{filepath}\n\n"
+                    f"提示：可以在 Chrome DevTools → Network 面板中\n"
+                    f"直接拖入 .har 文件查看完整请求记录"
+                )
+                self.status_label.configure(text=f"已导出 HAR 到: {filepath}")
+            except Exception as e:
+                messagebox.showerror("导出失败", f"导出失败：\n{str(e)}")
+
     def _show_error(self, message):
         """显示错误信息"""
         self.is_running = False
@@ -811,8 +927,10 @@ class CaptureGUI:
 
     def _on_close(self):
         """关闭窗口"""
+        logger.info("用户关闭窗口")
         self.is_running = False
         self.capture.stop()
+        self._stop_polling()
         self._cleanup_browser()
         self.root.destroy()
 
