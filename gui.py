@@ -68,13 +68,9 @@ class CaptureGUI:
     def __init__(self):
         self.capture = RequestCapture()
         self.browser_thread = None
-        self.playwright = None
-        self.browser = None
-        self.context = None
-        self.page = None
         self.is_running = False
         self.request_count = 0
-        self._poll_job = None  # 定时轮询任务 ID
+        self._poll_job = None
 
         self.root = tk.Tk()
         self.root.title("🔍 Playwright 网络抓包工具")
@@ -399,28 +395,16 @@ class CaptureGUI:
         except (ValueError, TypeError):
             return str(size_bytes)
 
-    def _get_status_color(self, status_code):
-        """根据状态码返回颜色"""
-        if status_code is None:
-            return self.COLORS["fg"]
-        code = int(status_code)
-        if 200 <= code < 300:
-            return self.COLORS["success"]
-        elif 300 <= code < 400:
-            return self.COLORS["info"]
-        elif 400 <= code < 500:
-            return self.COLORS["warning"]
-        else:
-            return self.COLORS["error"]
+    # ========== 轮询机制 ==========
 
     def _start_polling(self):
-        """启动定时轮询，每 200ms 从 capture 中读取新增请求并更新表格"""
+        """启动定时轮询"""
         if self._poll_job is not None:
             return
         self._poll()
 
     def _poll(self):
-        """轮询一次：读取新增请求，更新表格"""
+        """每 300ms 轮询 capture 中的新增请求"""
         new_requests = self.capture.get_new_requests()
         if new_requests:
             for req in new_requests:
@@ -429,14 +413,14 @@ class CaptureGUI:
             self.count_label.configure(text=f"共 {self.request_count} 条请求")
 
         if self.is_running:
-            self._poll_job = self.root.after(200, self._poll)
+            self._poll_job = self.root.after(300, self._poll)
 
     def _stop_polling(self):
         """停止定时轮询"""
         if self._poll_job is not None:
             self.root.after_cancel(self._poll_job)
             self._poll_job = None
-        # 最后再拉一次，确保不遗漏
+        # 最后拉一次
         new_requests = self.capture.get_new_requests()
         if new_requests:
             for req in new_requests:
@@ -444,23 +428,24 @@ class CaptureGUI:
                 self._insert_request_row(req, self.request_count)
             self.count_label.configure(text=f"共 {self.request_count} 条请求")
 
+    # ========== 表格操作 ==========
+
     def _insert_request_row(self, req, index):
         """插入一行请求到表格"""
         method = req.get("method", "-")
-        status = req.get("status_code", "-")
+        status = req.get("status_code")
+        status_str = str(status) if status is not None else "..."
         url = req.get("url", "-")
         resource_type = req.get("resource_type", "-")
         size = self._format_size(req.get("response_size"))
         timestamp = req.get("timestamp", "-")
 
-        # 截断过长的 URL
         display_url = url if len(url) <= 120 else url[:117] + "..."
 
         item_id = self.tree.insert("", tk.END, values=(
-            index, method, status, display_url, resource_type, size, timestamp
+            index, method, status_str, display_url, resource_type, size, timestamp
         ))
 
-        # 设置方法列颜色标签
         method_color = self.METHOD_COLORS.get(method.upper(), self.COLORS["fg"])
         self.tree.tag_configure(f"method_{method}_{index}", foreground=method_color)
         self.tree.item(item_id, tags=(f"method_{method}_{index}",))
@@ -476,13 +461,10 @@ class CaptureGUI:
         if not status:
             status = None
 
-        # 清空表格
         for item in self.tree.get_children():
             self.tree.delete(item)
 
-        # 获取过滤后的请求
         filtered = self.capture.get_filtered_requests(keyword, method, status)
-
         for i, req in enumerate(filtered):
             self._insert_request_row(req, i + 1)
 
@@ -509,7 +491,6 @@ class CaptureGUI:
 
     def _show_request_detail(self, req):
         """显示请求详情"""
-        # 通用信息
         general_info = (
             f"{'=' * 60}\n"
             f"  请求 URL:  {req.get('url', '-')}\n"
@@ -522,7 +503,6 @@ class CaptureGUI:
         )
         self._set_text(self.general_text, general_info)
 
-        # 请求头
         req_headers = req.get("request_headers", {})
         if req_headers:
             headers_str = "\n".join(f"  {k}: {v}" for k, v in req_headers.items())
@@ -530,7 +510,6 @@ class CaptureGUI:
         else:
             self._set_text(self.req_headers_text, "（无请求头数据）")
 
-        # 响应头
         resp_headers = req.get("response_headers", {})
         if resp_headers:
             headers_str = "\n".join(f"  {k}: {v}" for k, v in resp_headers.items())
@@ -538,23 +517,19 @@ class CaptureGUI:
         else:
             self._set_text(self.resp_headers_text, "（无响应头数据）")
 
-        # 响应体
         resp_body = req.get("response_body", "")
         if resp_body:
-            # 尝试格式化 JSON
             try:
                 parsed = json.loads(resp_body)
                 body_str = json.dumps(parsed, ensure_ascii=False, indent=2)
             except (json.JSONDecodeError, TypeError):
                 body_str = str(resp_body)
-            # 限制显示长度
             if len(body_str) > 50000:
-                body_str = body_str[:50000] + "\n\n... (内容过长，已截断，请导出 JSON 查看完整内容)"
+                body_str = body_str[:50000] + "\n\n... (内容过长，已截断)"
             self._set_text(self.resp_body_text, body_str)
         else:
             self._set_text(self.resp_body_text, "（无响应体数据）")
 
-        # 请求体
         req_body = req.get("request_body", "")
         if req_body:
             try:
@@ -578,6 +553,8 @@ class CaptureGUI:
         url = values[3]
         webbrowser.open(url)
 
+    # ========== 浏览器控制 ==========
+
     def _start_browser(self):
         """启动浏览器并开始抓包"""
         if self.is_running:
@@ -599,74 +576,163 @@ class CaptureGUI:
         self.stop_btn.configure(state=tk.NORMAL)
         self.status_label.configure(text="正在启动浏览器...")
 
-        # 启动定时轮询
         self._start_polling()
 
         self.browser_thread = threading.Thread(target=self._run_browser, args=(url,), daemon=True)
         self.browser_thread.start()
 
     def _run_browser(self, url):
-        """在独立线程中运行浏览器"""
+        """在独立线程中运行浏览器（核心抓包逻辑）"""
         logger.info(f"=== 浏览器线程启动 === url={url}")
+        pw = None
+        browser = None
+        context = None
+        page = None
+
         try:
             from playwright.sync_api import sync_playwright
-            logger.info("Playwright 导入成功")
 
-            self.playwright = sync_playwright().start()
-            logger.info("sync_playwright().start() 成功")
+            pw = sync_playwright().start()
+            logger.info("Playwright 启动成功")
 
-            # 启动 Chromium 浏览器（有头模式）
-            logger.info("正在启动 Chromium...")
-            self.browser = self.playwright.chromium.launch(
+            browser = pw.chromium.launch(
                 headless=False,
-                args=[
-                    "--disable-blink-features=AutomationControlled",
-                    "--no-sandbox",
-                ]
+                args=["--disable-blink-features=AutomationControlled", "--no-sandbox"]
             )
-            logger.info(f"Chromium 启动成功, connected={self.browser.is_connected()}")
+            logger.info("Chromium 启动成功")
 
-            # 创建上下文
-            self.context = self.browser.new_context(
+            context = browser.new_context(
                 viewport={"width": 1280, "height": 800},
                 user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
             )
-            logger.info("浏览器上下文创建成功")
 
-            # 创建页面
-            self.page = self.context.new_page()
+            page = context.new_page()
             logger.info("页面创建成功")
 
-            # 注册网络请求监听
-            self.page.on("request", self._on_request)
-            self.page.on("response", self._on_response)
-            logger.info("网络请求监听已注册")
+            # ===== 关键：注册事件监听 =====
+            # 使用闭包捕获 capture 对象，避免通过 self 跨线程访问
+            capture = self.capture
+
+            def on_request(request):
+                """请求事件：立即记录到 capture 列表"""
+                try:
+                    req_body = ""
+                    try:
+                        pd = request.post_data
+                        if pd:
+                            req_body = pd
+                    except Exception:
+                        pass
+
+                    req_headers = {}
+                    try:
+                        if request.headers:
+                            req_headers = dict(request.headers)
+                    except Exception:
+                        pass
+
+                    req_data = {
+                        "url": request.url,
+                        "method": request.method,
+                        "resource_type": request.resource_type,
+                        "timestamp": datetime.now().strftime("%H:%M:%S.%f")[:-3],
+                        "request_headers": req_headers,
+                        "request_body": req_body,
+                        "status_code": None,
+                        "response_headers": {},
+                        "response_body": "",
+                        "response_size": None,
+                    }
+                    capture.add_request(req_data)
+                except Exception as e:
+                    logger.error(f"on_request 异常: {e}")
+
+            def on_response(response):
+                """响应事件：更新对应请求的响应信息"""
+                try:
+                    # 在已有请求列表中找到匹配的记录并更新
+                    req_url = response.url
+                    req_method = response.request.method
+                    req_status = response.status
+
+                    # 获取响应头
+                    resp_headers = {}
+                    try:
+                        if response.headers:
+                            resp_headers = dict(response.headers)
+                    except Exception:
+                        pass
+
+                    # 获取响应体（仅文本类型）
+                    resp_body = ""
+                    resp_size = 0
+                    try:
+                        ct = ""
+                        try:
+                            ct = response.headers.get("content-type", "")
+                        except Exception:
+                            pass
+                        if any(t in ct.lower() for t in [
+                            "json", "text", "html", "xml", "javascript", "css",
+                            "form", "urlencoded", "plain"
+                        ]):
+                            body = response.text()
+                            if body:
+                                resp_body = body
+                                resp_size = len(body.encode("utf-8"))
+                    except Exception:
+                        pass
+
+                    # 在 capture 列表中找到最后一个匹配的未完成请求并更新
+                    all_reqs = capture.get_requests()
+                    for i in range(len(all_reqs) - 1, -1, -1):
+                        r = all_reqs[i]
+                        if (r.get("url") == req_url and
+                                r.get("method") == req_method and
+                                r.get("status_code") is None):
+                            r["status_code"] = req_status
+                            r["response_headers"] = resp_headers
+                            if resp_body:
+                                r["response_body"] = resp_body
+                                r["response_size"] = resp_size
+                            break
+                    else:
+                        # 没找到匹配的请求，新增一条
+                        capture.add_request({
+                            "url": req_url,
+                            "method": req_method,
+                            "resource_type": "",
+                            "timestamp": datetime.now().strftime("%H:%M:%S.%f")[:-3],
+                            "request_headers": {},
+                            "request_body": "",
+                            "status_code": req_status,
+                            "response_headers": resp_headers,
+                            "response_body": resp_body,
+                            "response_size": resp_size if resp_size else None,
+                        })
+                except Exception as e:
+                    logger.error(f"on_response 异常: {e}")
+
+            page.on("request", on_request)
+            page.on("response", on_response)
+            logger.info("事件监听已注册")
 
             self.root.after(0, lambda: self.status_label.configure(
                 text=f"浏览器已启动 - 正在抓包中... | URL: {url}"))
 
             # 导航到目标 URL
             logger.info(f"正在导航到: {url}")
-            self.page.goto(url, wait_until="domcontentloaded")
+            page.goto(url, wait_until="domcontentloaded")
             logger.info(f"页面加载完成: {url}")
 
-            # 保持浏览器打开，直到用户点击停止或手动关闭浏览器窗口
-            logger.info("进入保持循环, 等待用户操作...")
-            try:
-                loop_count = 0
-                while self.is_running:
-                    # 检查浏览器是否被用户手动关闭
-                    connected = self.browser.is_connected()
-                    if not connected:
-                        logger.warning(f"浏览器连接已断开 (loop #{loop_count})")
-                        break
-                    if loop_count % 20 == 0:
-                        logger.debug(f"保持循环中... (loop #{loop_count}, connected={connected})")
-                    loop_count += 1
-                    time.sleep(0.5)
-                logger.info(f"保持循环退出, loop_count={loop_count}, is_running={self.is_running}")
-            except Exception as e:
-                logger.error(f"保持循环异常: {e}", exc_info=True)
+            # 保持浏览器打开
+            logger.info("进入保持循环...")
+            while self.is_running:
+                if not browser.is_connected():
+                    logger.warning("浏览器被用户手动关闭")
+                    break
+                time.sleep(0.5)
+            logger.info("保持循环退出")
 
         except ImportError:
             logger.error("Playwright 库未安装")
@@ -676,138 +742,31 @@ class CaptureGUI:
                 "playwright install chromium"
             ))
         except Exception as e:
-            logger.error(f"浏览器启动失败: {e}", exc_info=True)
+            logger.error(f"浏览器异常: {e}", exc_info=True)
             self.root.after(0, lambda: self._show_error(f"启动浏览器失败：\n{str(e)}"))
         finally:
             logger.info("=== 浏览器线程结束, 开始清理 ===")
             try:
-                if self.playwright:
-                    self.playwright.stop()
-                    logger.info("playwright.stop() 完成")
-            except Exception as e:
-                logger.error(f"playwright.stop() 异常: {e}", exc_info=True)
-            self._cleanup_browser()
+                if page:
+                    page.close()
+            except Exception:
+                pass
+            try:
+                if context:
+                    context.close()
+            except Exception:
+                pass
+            try:
+                if browser and browser.is_connected():
+                    browser.close()
+            except Exception:
+                pass
+            try:
+                if pw:
+                    pw.stop()
+            except Exception:
+                pass
             logger.info("清理完成")
-
-    def _on_request(self, request):
-        """处理请求事件"""
-        try:
-            req_headers = {}
-            try:
-                headers = request.headers
-                if headers:
-                    req_headers = dict(headers)
-            except Exception as e:
-                logger.debug(f"获取请求头失败: {e}")
-
-            req_body = ""
-            try:
-                post_data = request.post_data
-                if post_data:
-                    req_body = post_data
-            except Exception as e:
-                logger.debug(f"获取请求体失败: {e}")
-
-            # 使用自增序号作为唯一 ID，避免 URL+method 重复导致覆盖
-            if not hasattr(self, '_req_counter'):
-                self._req_counter = 0
-            self._req_counter += 1
-
-            req_data = {
-                "_id": self._req_counter,
-                "url": request.url,
-                "method": request.method,
-                "resource_type": request.resource_type,
-                "timestamp": datetime.now().strftime("%H:%M:%S.%f")[:-3],
-                "request_headers": req_headers,
-                "request_body": req_body,
-                "status_code": None,
-                "response_headers": {},
-                "response_body": "",
-                "response_size": None,
-            }
-
-            # 用唯一 ID 存储到 pending，等响应到达时补充
-            if not hasattr(self, '_pending_requests'):
-                self._pending_requests = {}
-            self._pending_requests[id(request)] = req_data
-
-            # 直接添加到捕获列表
-            self.capture.add_request(req_data)
-
-        except Exception as e:
-            logger.error(f"_on_request 异常: {e}", exc_info=True)
-
-    def _on_response(self, response):
-        """处理响应事件 - 更新已有请求的响应信息"""
-        try:
-            # 通过 request 对象的 id 查找对应的 pending 记录
-            req_data = None
-            if hasattr(self, '_pending_requests'):
-                # 遍历找到匹配的请求（url + method + 时间戳匹配）
-                for key, pending in list(self._pending_requests.items()):
-                    if (pending.get("url") == response.url and
-                            pending.get("method") == response.request.method and
-                            pending.get("status_code") is None):
-                        req_data = pending
-                        self._pending_requests.pop(key, None)
-                        break
-
-            if req_data is None:
-                # 没有对应的请求记录，创建一个新的
-                if not hasattr(self, '_req_counter'):
-                    self._req_counter = 0
-                self._req_counter += 1
-                req_data = {
-                    "_id": self._req_counter,
-                    "url": response.url,
-                    "method": response.request.method,
-                    "resource_type": "",
-                    "timestamp": datetime.now().strftime("%H:%M:%S.%f")[:-3],
-                    "request_headers": {},
-                    "request_body": "",
-                    "status_code": None,
-                    "response_headers": {},
-                    "response_body": "",
-                    "response_size": None,
-                }
-                self.capture.add_request(req_data)
-
-            # 更新响应信息
-            req_data["status_code"] = response.status
-
-            # 获取响应头
-            try:
-                resp_headers = dict(response.headers)
-                req_data["response_headers"] = resp_headers
-            except Exception as e:
-                logger.debug(f"获取响应头失败: {e}")
-
-            # 获取响应体
-            try:
-                content_type = ""
-                try:
-                    content_type = response.headers.get("content-type", "")
-                except Exception:
-                    pass
-
-                # 只捕获文本类内容，避免二进制文件
-                if any(t in content_type.lower() for t in [
-                    "json", "text", "html", "xml", "javascript", "css",
-                    "form", "urlencoded", "plain"
-                ]):
-                    body = response.text()
-                    if body:
-                        req_data["response_body"] = body
-                        req_data["response_size"] = len(body.encode("utf-8"))
-            except Exception as e:
-                logger.debug(f"获取响应体失败 [{response.url}]: {e}")
-
-            # 通知 GUI 刷新该行
-            self.capture.update_request(req_data)
-
-        except Exception as e:
-            logger.error(f"_on_response 异常: {e}", exc_info=True)
 
     def _stop_browser(self):
         """停止浏览器"""
@@ -819,34 +778,10 @@ class CaptureGUI:
         self.stop_btn.configure(state=tk.DISABLED)
 
         if self.browser_thread and self.browser_thread.is_alive():
-            # 等待线程结束
             self.browser_thread.join(timeout=5)
 
-        self._cleanup_browser()
         self.start_btn.configure(state=tk.NORMAL)
         self.status_label.configure(text=f"抓包已停止 - 共捕获 {self.request_count} 条请求")
-
-    def _cleanup_browser(self):
-        """清理浏览器资源"""
-        try:
-            if self.page and not self.page.is_closed():
-                self.page.close()
-        except Exception:
-            pass
-        try:
-            if self.context:
-                self.context.close()
-        except Exception:
-            pass
-        try:
-            if self.browser and self.browser.is_connected():
-                self.browser.close()
-        except Exception:
-            pass
-        self.page = None
-        self.context = None
-        self.browser = None
-        self.playwright = None
 
     def _clear_requests(self):
         """清空请求列表"""
@@ -931,7 +866,6 @@ class CaptureGUI:
         self.is_running = False
         self.capture.stop()
         self._stop_polling()
-        self._cleanup_browser()
         self.root.destroy()
 
     def run(self):
